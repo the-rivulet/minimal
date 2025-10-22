@@ -1,13 +1,12 @@
 [package]
 name = "minimal"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.50", features = ["derive"] }
 colored = "3.0.0"
-copypasta = "0.10.2"
 data-encoding = "2.9.0"
 futures-lite = "2.6.1"
 iroh = "0.93.2"
