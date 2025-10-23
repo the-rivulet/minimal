@@ -28,8 +28,6 @@ struct Args {
     /// Set the bind port for our socket. By default, a random port will be used.
     #[clap(short, long, default_value = "0")]
     bind_port: u16,
-    #[clap(short, long, default_value = "0")]
-    timeout: i32,
     #[clap(subcommand)]
     command: Command,
 }
@@ -62,7 +60,7 @@ fn bytes_from_str(s: &str) -> [u8; 32] {
     result
 }
 
-const MINIMAL_VERSION: &str = "0.3.0"; // minimal's version, should be consistent with Cargo.toml
+const MINIMAL_VERSION: &str = "0.3.1"; // minimal's version, should be consistent with Cargo.toml
 const MINIMAL_TOPIC_HEADER: &str = "the-rivulet/minimal/topic/"; // prefix for topics
 const MINIMAL_HOST_KEY_KEADER: &str = "the-rivulet/minimal/host/"; // prefix for secret keys
 const CONNECTION_TIMEOUT_SECS: u64 = 10; // seconds to wait before assuming network issue
