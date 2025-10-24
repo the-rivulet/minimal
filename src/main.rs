@@ -1,17 +1,11 @@
-use std::{collections::HashMap, fs, io::ErrorKind, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::HashMap, fs, io::{stdout, ErrorKind, Write}, sync::{Arc, Mutex}, time::Duration};
 use anyhow::Result;
 use clap::Parser;
+use crossterm::{cursor::{MoveTo, MoveToNextLine}, event::{DisableMouseCapture, EnableMouseCapture, Event::{Key, Mouse, Resize}, EventStream, KeyCode, MouseEventKind}, execute, style::Stylize, terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, size, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen}};
 use futures_lite::StreamExt;
-use iroh::{
-    discovery::static_provider::StaticProvider, protocol::Router, Endpoint, NodeAddr, NodeId, PublicKey, SecretKey
-};
-use iroh_gossip::{
-    net::{Gossip},
-    api::{Event, GossipReceiver},
-    proto::TopicId,
-};
+use iroh::{discovery::static_provider::StaticProvider, protocol::Router, Endpoint, NodeAddr, NodeId, PublicKey, SecretKey};
+use iroh_gossip::{net::Gossip, api::{Event, GossipReceiver}, proto::TopicId};
 use serde::{Deserialize, Serialize};
-use colored::Colorize;
 
 /// Chat over iroh-gossip
 ///
@@ -60,7 +54,7 @@ fn bytes_from_str(s: &str) -> [u8; 32] {
     result
 }
 
-const MINIMAL_VERSION: &str = "0.3.1"; // minimal's version, should be consistent with Cargo.toml
+const MINIMAL_VERSION: &str = "0.4.0"; // minimal's version, should be consistent with Cargo.toml
 const MINIMAL_TOPIC_HEADER: &str = "the-rivulet/minimal/topic/"; // prefix for topics
 const MINIMAL_HOST_KEY_KEADER: &str = "the-rivulet/minimal/host/"; // prefix for secret keys
 const CONNECTION_TIMEOUT_SECS: u64 = 10; // seconds to wait before assuming network issue
@@ -72,12 +66,12 @@ async fn main() -> Result<()> {
     let topic = TopicId::from_bytes(bytes_from_str(&(MINIMAL_TOPIC_HEADER.to_owned() + MINIMAL_VERSION)));
     let (is_host_node, secret_key) = match &args.command {
         Command::Open => {
-            println!("{}", "> opening chat room as host...".blue().dimmed());
+            println!("{}", "> opening chat room as host...".blue().dim());
             // set to None because we want to become the host node
             (true, SecretKey::from_bytes(&bytes_from_str(&(MINIMAL_HOST_KEY_KEADER.to_owned() + MINIMAL_VERSION))))
         }
         Command::Join => {
-            println!("{}", "> attempting to join chat room...".blue().dimmed());
+            println!("{}", "> attempting to join chat room...".blue().dim());
             (false, SecretKey::generate(&mut rand::rng()))
         }
     };
@@ -105,8 +99,13 @@ async fn main() -> Result<()> {
         fs::write(CONFIG_PATH, "{\n    \"name\": \"\"\n}")?;
     }
     let minconfig: MinConfig = serde_json::from_str(&fs::read_to_string(CONFIG_PATH)?)?;
+    // quick warning if the terminal is too tiny
+    let (term_cols, term_rows) = size()?;
+    if (term_cols < MIN_TERM_COLS) || (term_rows < MIN_TERM_ROWS) {
+        println!("{}", format!("> terminal is too small to play, should be at least {MIN_TERM_COLS} x {MIN_TERM_ROWS}.").yellow());
+    }
 
-    println!("{}", "> connecting to the network...".blue().dimmed());
+    println!("{}", "> connecting to the network...".blue().dim());
     let wait_for_online = endpoint.online();
     if let Err(_) = tokio::time::timeout(Duration::from_secs(CONNECTION_TIMEOUT_SECS), wait_for_online).await {
         panic!("{}", std::io::Error::new(
@@ -119,7 +118,7 @@ async fn main() -> Result<()> {
         println!("{}", "> server started, waiting for nodes to join us".blue());
         vec![]
     } else {
-        println!("{}", "> trying to reach host node...".blue().dimmed());
+        println!("{}", "> trying to reach host node...".blue().dim());
         // mimic the logic used to generate the host key
         let host_key = &bytes_from_str(&(MINIMAL_HOST_KEY_KEADER.to_owned() + MINIMAL_VERSION));
         let host_addr = NodeAddr::new(SecretKey::from_bytes(host_key).public())
@@ -157,10 +156,10 @@ async fn main() -> Result<()> {
         None
     };
     if let Some(name) = my_nickname {
-        let message = Message::new(MessageBody::AboutMe {
+        let message = MinimalMessage::new(MinimalMessageType::Chat(ChatMessage::AboutMe {
             from: endpoint.node_id(),
             name,
-        });
+        }));
         sender.broadcast(message.to_vec().into()).await?;
     }
 
@@ -187,10 +186,10 @@ async fn main() -> Result<()> {
             let arguments: Vec<_> = text.trim().split(" ").collect();
             if arguments[0] == "/nick" {
                 let new_nick = arguments[1..].join(" ");
-                let message = Message::new(MessageBody::AboutMe {
+                let message = MinimalMessage::new(MinimalMessageType::Chat(ChatMessage::AboutMe {
                     from: endpoint.node_id(),
                     name: new_nick.to_string(),
-                });
+                }));
                 // broadcast the encoded message
                 sender.broadcast(message.to_vec().into()).await?;
                 // print a confirmation message
@@ -199,42 +198,37 @@ async fn main() -> Result<()> {
                 break;
             } else if arguments[0] == "/min" {
                 // lock will be released at end of scope
-                match game_request_tracker.lock() {
-                    Ok(mut requester) => {
-                        match *requester {
-                            Some(other_requester) => {
-                                let game_id = rand::random_range(0.0..=1e9);
-                                let message = Message::new(MessageBody::GameStart {
-                                    from: endpoint.node_id(),
-                                    orig_sender: other_requester,
-                                    game_id: game_id
-                                });
-                                sender.broadcast(message.to_vec().into()).await?;
-                                println!("{}", "> ok, starting a game!".green());
-                                tokio::spawn(begin_game(game_id, gossip_arc.clone(), vec![]));
-                            }
-                            None => {
-                                let message = Message::new(MessageBody::GameRequest {
-                                    from: endpoint.node_id(),
-                                });
-                                sender.broadcast(message.to_vec().into()).await?;
-                                *requester = Some(endpoint.node_id()); // we are requesting
-                                println!("{}", format!("> joined the minimal queue!").green());
-                            }
-                        }
+                let mut requester = game_request_tracker.lock().expect("should be able to acquire lock");
+                match *requester {
+                    Some(other_requester) => {
+                        let game_id = rand::random_range(0.0..=1e9);
+                        let message = MinimalMessage::new(MinimalMessageType::Chat(ChatMessage::GameStart {
+                            from: endpoint.node_id(),
+                            orig_sender: other_requester,
+                            game_id: game_id
+                        }));
+                        sender.broadcast(message.to_vec().into()).await?;
+                        *requester = None; // the queue has been emptied
+                        println!("{}", "> ok, starting a game!".green());
+                        tokio::spawn(begin_game(game_id, gossip_arc.clone(), vec![]));
                     }
-                    Err(err) => {
-                        println!("{}", format!("could not acquire lock: {err}").red());
+                    None => {
+                        let message = MinimalMessage::new(MinimalMessageType::Chat(ChatMessage::GameRequest {
+                            from: endpoint.node_id(),
+                        }));
+                        sender.broadcast(message.to_vec().into()).await?;
+                        *requester = Some(endpoint.node_id()); // we are requesting
+                        println!("{}", format!("> joined the minimal queue!").green());
                     }
                 } // released here
             } else {
                 println!("{}", format!("unknown command: {}", text.trim()).red());
             }
         } else {
-            let message = Message::new(MessageBody::Message {
+            let message = MinimalMessage::new(MinimalMessageType::Chat(ChatMessage::Message {
                 from: endpoint.node_id(),
                 text: text.clone(),
-            });
+            }));
             // broadcast the encoded message
             sender.broadcast(message.to_vec().into()).await?;
         }
@@ -245,31 +239,37 @@ async fn main() -> Result<()> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Message {
-    body: MessageBody,
+struct MinimalMessage {
+    body: MinimalMessageType,
     nonce: [u8; 16],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum MessageBody {
+enum MinimalMessageType {
+    Chat(ChatMessage),
+    Game(GameMessage),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum ChatMessage {
     AboutMe { from: NodeId, name: String },
     Message { from: NodeId, text: String },
     GameRequest { from: NodeId },
     GameStart { from: NodeId, orig_sender: NodeId, game_id: f64 },
 }
 
-impl Message {
+#[derive(Debug, Serialize, Deserialize)]
+enum GameMessage {
+    Aborted {}
+}
+
+impl MinimalMessage {
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
         serde_json::from_slice(bytes).map_err(Into::into)
     }
-
-    pub fn new(body: MessageBody) -> Self {
-        Self {
-            body,
-            nonce: rand::random(),
-        }
+    pub fn new(body: MinimalMessageType) -> Self {
+        Self { body, nonce: rand::random(), }
     }
-
     pub fn to_vec(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("serde_json::to_vec is infallible")
     }
@@ -290,57 +290,48 @@ async fn subscribe_loop(mut receiver: GossipReceiver, our_id: PublicKey, gossip:
         // if the Event is a `GossipEvent::Received`, let's deserialize the message:
         if let Event::Received(msg) = event {
             // deserialize the message and match on the message type:
-            match Message::from_bytes(&msg.content)?.body {
-                MessageBody::AboutMe { from, name } => {
-                    // if it's an `AboutMe` message
-                    // check for the old name first
-                    let old_name = get_name(&names, from);
-                    // insert the new name
-                    names.insert(from, name.clone());
-                    println!("{}", format!("> {} is now known as {}", old_name, name).blue());
-                }
-                MessageBody::Message { from, text } => {
-                    // if it's a `Message` message, get the name from the map and print the message
-                    let name = get_name(&names, from);
-                    println!("{}: {}", name.bold().magenta(), text.trim().cyan());
-                }
-                MessageBody::GameRequest { from } => {
-                    // lock will be released at end of scope
-                    match game_request_tracker.lock() {
-                        Ok(mut requester) => {
-                            *requester = Some(from);
-                            let name = get_name(&names, from);
-                            println!("{}", format!("> {} is in the minimal queue, use /min to join!", name).blue());
-                        }
-                        Err(err) => {
-                            println!("{}", format!("could not acquire lock: {err}").red());
-                        }
+            if let MinimalMessageType::Chat(chat_message) = MinimalMessage::from_bytes(&msg.content)?.body {
+                match chat_message {
+                    ChatMessage::AboutMe { from, name } => {
+                        // if it's an `AboutMe` message
+                        // check for the old name first
+                        let old_name = get_name(&names, from);
+                        // insert the new name
+                        names.insert(from, name.clone());
+                        println!("{}", format!("> {} is now known as {}", old_name, name).blue());
+                    }
+                    ChatMessage::Message { from, text } => {
+                        // if it's a `Message` message, get the name from the map and print the message
+                        let name = get_name(&names, from);
+                        println!("{}: {}", name.bold().magenta(), text.trim().cyan());
+                    }
+                    ChatMessage::GameRequest { from } => {
+                        // lock will be released at end of scope
+                        let mut requester = game_request_tracker.lock().expect("should be able to acquire lock");
+                        *requester = Some(from);
+                        let name = get_name(&names, from);
+                        println!("{}", format!("> {} is in the minimal queue, use /min to join!", name).blue());
                     } // released here
-                }
-                MessageBody::GameStart { from, orig_sender, game_id } => {
-                    // lock will be released at end of scope
-                    match game_request_tracker.lock() {
-                        Ok(mut requester) => {
-                            *requester = None; // the queue is now empty since a game has started
-                            // the reason for including orig_sender is because we might have joined the chat
-                            // after the request was sent. currently we don't need to know who is currently
-                            // in a game but it could be useful later
-                            let accepter_name = get_name(&names, from);
-                            let sender_name = get_name(&names, orig_sender);
-                            println!("{}", format!("> {} started a game with {}!", accepter_name, sender_name).blue());
-                            if orig_sender == our_id {
-                                println!("{}", "> your invite was accepted, starting a game!".green());
-                                tokio::spawn(begin_game(game_id, gossip.clone(), vec![from]));
-                            }
-                        }
-                        Err(err) => {
-                            println!("{}", format!("could not acquire lock: {err}").red());
-                        }
-                    } // released here
+                    ChatMessage::GameStart { from, orig_sender, game_id } => {
+                        // lock will be released at end of scope
+                        let mut requester = game_request_tracker.lock().expect("should be able to acquire lock");
+                        *requester = None; // the queue is now empty since a game has started
+                        // the reason for including orig_sender is because we might have joined the chat
+                        // after the request was sent. currently we don't need to know who is currently
+                        // in a game but it could be useful later
+                        let accepter_name = get_name(&names, from);
+                        let sender_name = get_name(&names, orig_sender);
+                        println!("{}", format!("> {} started a game with {}!", accepter_name, sender_name).blue());
+                        if orig_sender == our_id {
+                            println!("{}", "> your invite was accepted, starting a game!".green());
+                            tokio::spawn(begin_game(game_id, gossip.clone(), vec![from]));
+                        } // released here
+                    }
                 }
             }
         }
     }
+    println!("{}", "> chat manager thread was closed.".red());
     Ok(())
 }
 
@@ -354,14 +345,108 @@ fn input_loop(line_tx: tokio::sync::mpsc::Sender<String>) -> Result<()> {
     }
 }
 
+// these are u16 for convenient comparison, they really could be i8 or something
+const MIN_TERM_COLS: u16 = 30;
+const MIN_TERM_ROWS: u16 = 7;
+
 async fn begin_game(game_id: f64, gossip: Arc<Gossip>, bootstrap: Vec<PublicKey>) -> Result<()> {
     let mut result = [0u8; 32]; // Initialize with zeros
     let bytes = game_id.to_le_bytes();
     let len = bytes.len();
     result[..len].copy_from_slice(&bytes);
+    println!("{:?}", result);
     let topic = TopicId::from_bytes(result);
-    println!("{}", "> waiting for other player...".blue().dimmed());
-    let (_sender, _receiver) = gossip.subscribe_and_join(topic, bootstrap).await?.split();
-    println!("{}", "yay we did it!!! todo: actually implement mnml :3".bold());
+    println!("{:?}", topic);
+    println!("{}", "> waiting for other player...".blue().dim());
+    let (sender, receiver) = gossip.subscribe_and_join(topic, bootstrap).await?.split();
+    // open yet another thread to deal with the sub events
+    tokio::spawn(game_subscribe_loop(receiver));
+    let (mut term_cols, mut term_rows) = size()?;
+    // set up terminal stuff
+    let mut event_reader = EventStream::new();
+    let mut stdout = stdout();
+    stdout.flush()?;
+    enable_raw_mode()?;
+    execute!(stdout, EnableMouseCapture, EnterAlternateScreen)?;
+    // before doing anything else ensure that the terminal is big enough
+    // if not, just immediately abort.
+    if (term_cols < MIN_TERM_COLS) || (term_rows < MIN_TERM_ROWS) {
+        let message = MinimalMessage::new(MinimalMessageType::Game(GameMessage::Aborted {}));
+        sender.broadcast(message.to_vec().into()).await?;
+        println!("{}", format!("> game aborted due to terminal being too small (should be at least {MIN_TERM_COLS} cols x {MIN_TERM_ROWS} rows).").yellow());
+    }
+    while let Some(event) = event_reader.try_next().await? {
+        if !is_raw_mode_enabled()? {
+            // if raw mode was unexpectedly disabled, the game probably ended
+            // todo: make sure that we are on the alternate screen (raw mode is expected to be off on the main one)
+            // (doesn't need to be done till I implement switching screens in-game)
+            println!("{}", "> aborting because opponent quit.".yellow());
+            break
+        }
+        // re-rendering time!! there is no way to avoid redrawing the entire screen iirc, so just do it
+        // draw the minimal border
+        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        write!(stdout, "┌ minimal {}┐", "─".repeat((term_cols - 11).into()))?;
+        for _i in 1..(term_rows-1) {
+            execute!(stdout, MoveToNextLine(1))?;
+            write!(stdout, "│{}│", " ".repeat((term_cols - 2).into()))?;
+        }
+        execute!(stdout, MoveTo(0, term_rows-1))?;
+        write!(stdout, "└{}┘", "─".repeat((term_cols - 2).into()))?;
+        execute!(stdout, MoveTo(2, 2))?;
+        write!(stdout, "{}", "todo: game goes here".on_dark_cyan())?;
+        match event {
+            Key(key_event) => {
+                if key_event.code == KeyCode::Char('q') {
+                    // quit
+                    disable_raw_mode()?;
+                    execute!(stdout, DisableMouseCapture, LeaveAlternateScreen)?;
+                    let message = MinimalMessage::new(MinimalMessageType::Game(GameMessage::Aborted {}));
+                    sender.broadcast(message.to_vec().into()).await?;
+                    println!("{}", "> game aborted.".yellow());
+                    break
+                }
+            },
+            Mouse(mouse_event) => {
+                match mouse_event.kind {
+                    MouseEventKind::Moved => {
+                        execute!(stdout, MoveTo(mouse_event.column + 1, mouse_event.row + 1))?;
+                        write!(stdout, "{}", "*".magenta())?;
+                        stdout.flush()?;
+                    }
+                    _ => {}
+                }
+            },
+            Resize(new_cols, new_rows) => {
+                term_cols = new_cols;
+                term_rows = new_rows;
+                if (term_cols < MIN_TERM_COLS) || (term_rows < MIN_TERM_ROWS) {
+                    let message = MinimalMessage::new(MinimalMessageType::Game(GameMessage::Aborted {}));
+                    sender.broadcast(message.to_vec().into()).await?;
+                    println!("{}", format!("> game aborted due to terminal being resized to a too small size (should be at least {MIN_TERM_COLS} cols x {MIN_TERM_ROWS} rows).").yellow());
+                }
+            }
+            _ => {}
+        }
+    };
+    Ok(())
+}
+
+async fn game_subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
+    while let Some(event) = receiver.try_next().await? {
+        if let Event::Received(msg) = event {
+            // deserialize the message and match on the message type:
+            if let MinimalMessageType::Game(game_message) = MinimalMessage::from_bytes(&msg.content)?.body {
+                match game_message {
+                    GameMessage::Aborted {} => {
+                        disable_raw_mode()?;
+                        execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+                        println!("{}", "> opponent aborted the game.".yellow());
+                        break
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
