@@ -1,7 +1,9 @@
+mod min;
+
 use std::{collections::HashMap, fs, io::{stdout, ErrorKind, Write}, sync::{Arc, Mutex}, time::Duration};
 use anyhow::Result;
 use clap::Parser;
-use crossterm::{cursor::{MoveTo, MoveToNextLine}, event::{DisableMouseCapture, EnableMouseCapture, Event::{Key, Mouse, Resize}, EventStream, KeyCode, MouseEventKind}, execute, style::Stylize, terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, size, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen}};
+use crossterm::{cursor::MoveTo, event::{DisableMouseCapture, EnableMouseCapture, Event::{Key, Mouse, Resize}, EventStream, KeyCode, MouseEventKind}, execute, style::Stylize, terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, size, EnterAlternateScreen, LeaveAlternateScreen}};
 use futures_lite::StreamExt;
 use iroh::{discovery::static_provider::StaticProvider, protocol::Router, Endpoint, NodeAddr, NodeId, PublicKey, SecretKey};
 use iroh_gossip::{net::Gossip, api::{Event, GossipReceiver}, proto::TopicId};
@@ -54,7 +56,7 @@ fn bytes_from_str(s: &str) -> [u8; 32] {
     result
 }
 
-const MINIMAL_VERSION: &str = "0.4.0"; // minimal's version, should be consistent with Cargo.toml
+const MINIMAL_VERSION: &str = "0.5.0"; // minimal's version, should be consistent with Cargo.toml
 const MINIMAL_TOPIC_HEADER: &str = "the-rivulet/minimal/topic/"; // prefix for topics
 const MINIMAL_HOST_KEY_KEADER: &str = "the-rivulet/minimal/host/"; // prefix for secret keys
 const CONNECTION_TIMEOUT_SECS: u64 = 10; // seconds to wait before assuming network issue
@@ -346,7 +348,7 @@ fn input_loop(line_tx: tokio::sync::mpsc::Sender<String>) -> Result<()> {
 }
 
 // these are u16 for convenient comparison, they really could be i8 or something
-const MIN_TERM_COLS: u16 = 30;
+const MIN_TERM_COLS: u16 = 60;
 const MIN_TERM_ROWS: u16 = 7;
 
 async fn begin_game(game_id: f64, gossip: Arc<Gossip>, bootstrap: Vec<PublicKey>) -> Result<()> {
@@ -354,9 +356,7 @@ async fn begin_game(game_id: f64, gossip: Arc<Gossip>, bootstrap: Vec<PublicKey>
     let bytes = game_id.to_le_bytes();
     let len = bytes.len();
     result[..len].copy_from_slice(&bytes);
-    println!("{:?}", result);
     let topic = TopicId::from_bytes(result);
-    println!("{:?}", topic);
     println!("{}", "> waiting for other player...".blue().dim());
     let (sender, receiver) = gossip.subscribe_and_join(topic, bootstrap).await?.split();
     // open yet another thread to deal with the sub events
@@ -375,6 +375,8 @@ async fn begin_game(game_id: f64, gossip: Arc<Gossip>, bootstrap: Vec<PublicKey>
         sender.broadcast(message.to_vec().into()).await?;
         println!("{}", format!("> game aborted due to terminal being too small (should be at least {MIN_TERM_COLS} cols x {MIN_TERM_ROWS} rows).").yellow());
     }
+    let game_state = min::MinimalGameState::new();
+    let mut cursor_col = 0; let mut cursor_row = 0;
     while let Some(event) = event_reader.try_next().await? {
         if !is_raw_mode_enabled()? {
             // if raw mode was unexpectedly disabled, the game probably ended
@@ -384,17 +386,9 @@ async fn begin_game(game_id: f64, gossip: Arc<Gossip>, bootstrap: Vec<PublicKey>
             break
         }
         // re-rendering time!! there is no way to avoid redrawing the entire screen iirc, so just do it
-        // draw the minimal border
-        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-        write!(stdout, "┌ minimal {}┐", "─".repeat((term_cols - 11).into()))?;
-        for _i in 1..(term_rows-1) {
-            execute!(stdout, MoveToNextLine(1))?;
-            write!(stdout, "│{}│", " ".repeat((term_cols - 2).into()))?;
-        }
-        execute!(stdout, MoveTo(0, term_rows-1))?;
-        write!(stdout, "└{}┘", "─".repeat((term_cols - 2).into()))?;
-        execute!(stdout, MoveTo(2, 2))?;
-        write!(stdout, "{}", "todo: game goes here".on_dark_cyan())?;
+        // also it seems like using position() causes the entire terminal to just. crash. so I guess not doing that.
+        // instead, keep track of the mouse position above
+        game_state.ui(term_cols, term_rows, cursor_col, cursor_row)?;
         match event {
             Key(key_event) => {
                 if key_event.code == KeyCode::Char('q') {
@@ -410,8 +404,9 @@ async fn begin_game(game_id: f64, gossip: Arc<Gossip>, bootstrap: Vec<PublicKey>
             Mouse(mouse_event) => {
                 match mouse_event.kind {
                     MouseEventKind::Moved => {
-                        execute!(stdout, MoveTo(mouse_event.column + 1, mouse_event.row + 1))?;
-                        write!(stdout, "{}", "*".magenta())?;
+                        cursor_col = mouse_event.column;
+                        cursor_row = mouse_event.row;
+                        execute!(stdout, MoveTo(cursor_col, cursor_row))?;
                         stdout.flush()?;
                     }
                     _ => {}
